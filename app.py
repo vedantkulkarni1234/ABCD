@@ -1144,34 +1144,254 @@ def _init_states(specs: Dict[str, AgentSpec]) -> Dict[str, AgentState]:
     return {k: AgentState(chat=[], memory_summary="") for k in specs}
 
 
-def settings_apply(api_key: str, current: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = (api_key or "").strip()
-    st = dict(current or {})
-    st["api_key"] = api_key
+DEFAULT_MODEL_FALLBACK = "gemini-1.5-flash"
 
-    if api_key:
-        st["model_name"] = _pick_best_flash_model(api_key)
-        st["model_detected_at"] = datetime.utcnow().isoformat() + "Z"
+
+def _settings_file() -> Path:
+    p = os.getenv("VOID_SETTINGS_FILE")
+    if p:
+        return Path(p).expanduser()
+    return Path.home() / ".config" / "void-gemini-orchestrator" / "settings.json"
+
+
+def _read_persisted_settings() -> Dict[str, Any]:
+    path = _settings_file()
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+    finally:
+        try:
+            os.chmod(str(tmp), 0o600)
+        except Exception:
+            pass
+
+    tmp.replace(path)
+    try:
+        os.chmod(str(path), 0o600)
+    except Exception:
+        pass
+
+
+def _persist_settings(settings: Dict[str, Any]) -> None:
+    st = settings or {}
+    api_key = (st.get("api_key") or "").strip()
+    if not api_key:
+        return
+
+    payload = {
+        "api_key": api_key,
+        "model_name": st.get("model_name") or DEFAULT_MODEL_FALLBACK,
+        "model_detected_at": st.get("model_detected_at"),
+        "key_validated_at": st.get("key_validated_at"),
+        "has_25_flash": bool(st.get("has_25_flash")),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _atomic_write_json(_settings_file(), payload)
+
+
+def _delete_persisted_settings() -> None:
+    try:
+        _settings_file().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _mask_api_key(api_key: str) -> str:
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return "(none)"
+    if len(api_key) <= 8:
+        return "•" * len(api_key)
+    return f"{api_key[:4]}…{api_key[-4:]}"
+
+
+def _validate_api_key_and_pick_model(api_key: str) -> Tuple[bool, str, str, bool]:
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False, "API key is empty.", DEFAULT_MODEL_FALLBACK, False
+
+    genai.configure(api_key=api_key)
+
+    try:
+        available = {m.name.replace("models/", "") for m in genai.list_models()}
+    except Exception as e:
+        return False, f"Validation failed: {e}", DEFAULT_MODEL_FALLBACK, False
+
+    preferred = [
+        "gemini-2.5-flash-exp",
+        "gemini-2.5-flash-preview",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-exp",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+    ]
+
+    model_name = DEFAULT_MODEL_FALLBACK
+    for name in preferred:
+        if name in available:
+            model_name = name
+            break
+
+    has_25_flash = any(n.startswith("gemini-2.5-flash") for n in available)
+    return True, "OK", model_name, has_25_flash
+
+
+def settings_load_initial() -> Dict[str, Any]:
+    env_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    disk = _read_persisted_settings()
+
+    st: Dict[str, Any] = {
+        "api_key": "",
+        "api_key_source": None,
+        "model_name": DEFAULT_MODEL_FALLBACK,
+        "model_detected_at": None,
+        "key_validated_at": None,
+        "key_last_validation_error": None,
+        "has_25_flash": False,
+    }
+
+    # Prefer environment variables for deployments (they don't touch disk). If not present,
+    # fall back to persisted local settings.
+    if env_key:
+        st.update({"api_key": env_key, "api_key_source": "env"})
+        return st
+
+    if isinstance(disk, dict) and (disk.get("api_key") or "").strip():
+        st.update(
+            {
+                "api_key": (disk.get("api_key") or "").strip(),
+                "api_key_source": "disk",
+                "model_name": disk.get("model_name") or DEFAULT_MODEL_FALLBACK,
+                "model_detected_at": disk.get("model_detected_at"),
+                "key_validated_at": disk.get("key_validated_at"),
+                "key_last_validation_error": None,
+                "has_25_flash": bool(disk.get("has_25_flash")),
+            }
+        )
 
     return st
 
 
 def settings_status(settings: Dict[str, Any]) -> str:
-    if not settings or not settings.get("api_key"):
-        return "[!] API key not set. Go to Settings → paste key → Apply."\
-            "\nModel: gemini-1.5-flash (fallback)"
+    st = settings or {}
+    api_key = (st.get("api_key") or "").strip()
+
+    if not api_key:
+        err = (st.get("key_last_validation_error") or "").strip()
+        err_line = f"\nLast error: {err}" if err else ""
+        return textwrap.dedent(
+            f"""
+            [!] Gemini API key not set.{err_line}
+            - Model: {DEFAULT_MODEL_FALLBACK} (fallback)
+            - Tip: Settings → add key → Save & Validate
+            """
+        ).strip()
+
+    source = st.get("api_key_source") or "session"
+    model_name = st.get("model_name") or DEFAULT_MODEL_FALLBACK
+    detected = st.get("model_detected_at") or "(not detected yet)"
+
+    validated_at = st.get("key_validated_at")
+    err = st.get("key_last_validation_error")
+    if validated_at and not err:
+        headline = "[OK] Key validated."
+    elif validated_at and err:
+        headline = f"[!] Validation error: {err}"
+    else:
+        headline = "[!] Key loaded (not yet validated)."
+
+    validated = validated_at or "(not validated yet)"
+    has_25 = "yes" if st.get("has_25_flash") else "no / unknown"
 
     return textwrap.dedent(
         f"""
-        [OK] API key loaded.
-        Model: {settings.get('model_name')}
-        Detected: {settings.get('model_detected_at')}
+        {headline}
+        - Key: {_mask_api_key(api_key)}  (source: {source})
+        - Preferred Flash model: {model_name}
+        - Model detection: {detected}
+        - Key validation: {validated}
+        - Gemini 2.5 Flash available: {has_25}
         """
     ).strip()
 
 
-def settings_apply_and_status(api_key: str, current: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
-    st = settings_apply(api_key, current)
+def settings_save_and_validate(
+    api_key: str, persist_to_disk: bool, current: Dict[str, Any]
+) -> Tuple[Dict[str, Any], str]:
+    api_key = (api_key or "").strip()
+    st = dict(current or {})
+
+    ok, msg, model_name, has_25_flash = _validate_api_key_and_pick_model(api_key)
+    if not ok:
+        st["key_last_validation_error"] = msg
+        st["key_validated_at"] = datetime.utcnow().isoformat() + "Z"
+        return st, settings_status(st)
+
+    st.update(
+        {
+            "api_key": api_key,
+            "api_key_source": "disk" if persist_to_disk else "session",
+            "model_name": model_name,
+            "model_detected_at": datetime.utcnow().isoformat() + "Z",
+            "key_validated_at": datetime.utcnow().isoformat() + "Z",
+            "key_last_validation_error": None,
+            "has_25_flash": has_25_flash,
+        }
+    )
+
+    if persist_to_disk:
+        _persist_settings(st)
+
+    return st, settings_status(st)
+
+
+def settings_validate_current(current: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    st = dict(current or {})
+    api_key = (st.get("api_key") or "").strip()
+    ok, msg, model_name, has_25_flash = _validate_api_key_and_pick_model(api_key)
+
+    st["key_validated_at"] = datetime.utcnow().isoformat() + "Z"
+    st["has_25_flash"] = has_25_flash
+
+    if not ok:
+        st["key_last_validation_error"] = msg
+        return st, settings_status(st)
+
+    st["key_last_validation_error"] = None
+    st["model_name"] = model_name
+    st["model_detected_at"] = datetime.utcnow().isoformat() + "Z"
+    return st, settings_status(st)
+
+
+def settings_clear_key(current: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    _delete_persisted_settings()
+    st = dict(current or {})
+    st.update(
+        {
+            "api_key": "",
+            "api_key_source": None,
+            "model_name": DEFAULT_MODEL_FALLBACK,
+            "model_detected_at": None,
+            "key_validated_at": None,
+            "key_last_validation_error": None,
+            "has_25_flash": False,
+        }
+    )
     return st, settings_status(st)
 
 
@@ -1343,17 +1563,78 @@ def memory_send(
     return st.chat, memory_palace_view(agent_states, findings), agent_states, findings
 
 
+CODE_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_-]+)?\n(.*?)```", re.DOTALL)
+
+
+def extract_code_fences(text: str, max_blocks: int = 4) -> str:
+    blocks = CODE_FENCE_RE.findall(text or "")
+    if not blocks:
+        return ""
+    return "\n\n".join(b.strip() for b in blocks[:max_blocks]).strip()
+
+
+def extract_first_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+
+    fenced = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        try:
+            obj = json.loads(fenced.group(1))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            pass
+
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = dec.raw_decode(text[i:])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            continue
+
+    return None
+
+
+def _list_text(items: Sequence[str], limit: int = 120) -> str:
+    items = [i for i in (items or []) if i]
+    items = list(items)[:limit]
+    return "\n".join(items)
+
+
+def _scope_canvas_markdown(scope_text: str, seeds_text: str) -> str:
+    combined = "\n".join([(scope_text or "").strip(), (seeds_text or "").strip()]).strip()
+    intel = _extract_intel(combined) if combined else {"urls": [], "domains": [], "ips": [], "emails": [], "params": []}
+
+    lines = ["### Scope Canvas", ""]
+    if scope_text:
+        lines.append("**Declared scope (raw):**")
+        lines.append("```\n" + (scope_text.strip()[:9000]) + "\n```")
+
+    lines.append("**Detected in scope/seeds:**")
+    lines.append(f"- Domains: {len(intel.get('domains') or [])}")
+    lines.append(f"- URLs: {len(intel.get('urls') or [])}")
+    lines.append(f"- IPs: {len(intel.get('ips') or [])}")
+    lines.append(f"- Emails: {len(intel.get('emails') or [])}")
+    lines.append(f"- Params: {len(intel.get('params') or [])}")
+
+    return "\n".join(lines)
+
+
 def build_ui() -> gr.Blocks:
     specs = _specs()
+    initial_settings = settings_load_initial()
 
     with gr.Blocks(css=CSS, theme=gr.themes.Base(), title="VOID // Gemini Orchestrator") as demo:
-        settings_state = gr.State({"api_key": "", "model_name": "gemini-1.5-flash", "model_detected_at": None})
+        settings_state = gr.State(initial_settings)
         agent_states = gr.State(_init_states(specs))
         findings_state = gr.State([])  # list[dict]
 
         with gr.Tabs():
             # -----------------
-            # VOID (main)
+            # VOID (main) — high-bandwidth conversation + artifact ingestion
             # -----------------
             with gr.TabItem("Void"):
                 gr.HTML(f"<div class='void-hero'><pre>{VOID_ASCII}</pre></div>")
@@ -1366,15 +1647,13 @@ def build_ui() -> gr.Blocks:
                     lines=6,
                 )
                 with gr.Row():
-                    void_files = gr.File(label="Files", file_count="multiple")
-                    void_folder = gr.File(label="Folder", file_count="directory")
+                    void_files = gr.File(label="Artifacts (files)", file_count="multiple")
+                    void_folder = gr.File(label="Artifacts (folder)", file_count="directory")
 
                 with gr.Row():
                     void_send_btn = gr.Button("Engage")
                     void_save_btn = gr.Button("Save last reply → Findings")
 
-                # Wire events after all tabs/components exist (so Void can refresh other agents
-                # when it delegates work).
                 void_save_btn.click(
                     fn=lambda a, f: save_last_reply("void", a, f),
                     inputs=[agent_states, findings_state],
@@ -1386,56 +1665,791 @@ def build_ui() -> gr.Blocks:
                 )
 
             # -----------------
-            # Specialist tabs
+            # Recon Observatory — scope + source expansion + intel dashboard
             # -----------------
-            def _agent_tab(agent_key: str, title: str):
-                with gr.TabItem(title):
-                    chat = gr.Chatbot(label=None, height=520)
-                    inp = gr.Textbox(label=None, placeholder=f"Talk to {title}…", lines=4)
-                    with gr.Row():
-                        files = gr.File(label="Files", file_count="multiple")
-                        folder = gr.File(label="Folder", file_count="directory")
+            with gr.TabItem("Recon Observatory"):
+                gr.Markdown(
+                    """
+                    ### Recon Observatory
+                    **Purpose:** intake scope + seeds, expand coverage, and keep a live dashboard of discovered URLs/domains/params.
+                    """
+                )
 
-                    with gr.Row():
-                        send_btn = gr.Button("Send")
-                        save_btn = gr.Button("Save last reply → Findings")
+                with gr.Row():
+                    with gr.Column(scale=7):
+                        scope_tb = gr.Textbox(
+                            label="In-scope targets / constraints",
+                            placeholder="E.g. *.example.com, api.example.com, 192.0.2.0/24, out-of-scope: admin.example.com",
+                            lines=4,
+                        )
+                        seeds_tb = gr.Textbox(
+                            label="Seeds (starting URLs/domains)",
+                            placeholder="Paste known endpoints, domains, app store links, repo URLs…",
+                            lines=4,
+                        )
 
-                    def _send(user_text, up, fol, settings, states, findings):
-                        return agent_send(agent_key, user_text, up, fol, settings, states, findings)
+                        with gr.Accordion("Input sources (evidence)", open=True):
+                            with gr.Row():
+                                recon_files = gr.File(label="Files (HAR/JS/screenshots)", file_count="multiple")
+                                recon_folder = gr.File(label="Folder drop", file_count="directory")
 
-                    send_btn.click(
-                        fn=_send,
-                        inputs=[inp, files, folder, settings_state, agent_states, findings_state],
-                        outputs=[chat, agent_states, findings_state],
+                        recon_directive = gr.Textbox(
+                            label="Recon directive",
+                            placeholder="What should we map next? (tech fingerprinting, endpoint mining, auth surfaces, subdomain strategy…)",
+                            lines=3,
+                        )
+
+                        with gr.Row():
+                            recon_extract_btn = gr.Button("Extract intel (local)")
+                            recon_send_btn = gr.Button("Ask Recon (Gemini)")
+                            recon_save_btn = gr.Button("Save last reply → Findings")
+
+                        recon_chat = gr.Chatbot(label="Recon log", height=260)
+
+                    with gr.Column(scale=5):
+                        recon_scope_view = gr.Markdown(value="### Scope Canvas\n(press **Extract intel**)")
+                        recon_intel_summary = gr.Markdown(value="### Intake Summary\n(press **Extract intel**)")
+
+                        with gr.Accordion("Domains", open=False):
+                            recon_domains = gr.Code(language="text")
+                        with gr.Accordion("URLs", open=False):
+                            recon_urls = gr.Code(language="text")
+                        with gr.Accordion("Params", open=False):
+                            recon_params = gr.Code(language="text")
+                        with gr.Accordion("IPs / Emails", open=False):
+                            with gr.Row():
+                                recon_ips = gr.Code(language="text")
+                                recon_emails = gr.Code(language="text")
+                        with gr.Accordion("Tech hints", open=False):
+                            recon_tech = gr.Code(language="text")
+
+                def _recon_extract(scope_text, seeds_text, uploads, folder_uploads):
+                    combined = "\n".join([(scope_text or "").strip(), (seeds_text or "").strip()]).strip()
+                    declared = _extract_intel(combined) if combined else {"urls": [], "domains": [], "ips": [], "emails": [], "params": []}
+
+                    paths = _coerce_paths(uploads) + _coerce_paths(folder_uploads)
+                    pack = build_artifact_pack(paths)
+                    intel = dict(pack.get("intel") or {})
+
+                    merged: Dict[str, List[str]] = {}
+                    for k in ["urls", "domains", "ips", "emails", "params"]:
+                        merged[k] = sorted(set(intel.get(k, [])) | set(declared.get(k, [])))
+                    merged["tech"] = sorted(set(intel.get("tech", [])))
+
+                    scope_md = _scope_canvas_markdown(scope_text, seeds_text)
+                    summary_md = "### Intake Summary\n\n```\n" + (pack.get("summary") or "") + "\n```"
+
+                    return (
+                        scope_md,
+                        summary_md,
+                        _list_text(merged.get("domains", []), 220),
+                        _list_text(merged.get("urls", []), 220),
+                        _list_text(merged.get("params", []), 220),
+                        _list_text(merged.get("ips", []), 120),
+                        _list_text(merged.get("emails", []), 120),
+                        _list_text(merged.get("tech", []), 120),
                     )
-                    inp.submit(
-                        fn=_send,
-                        inputs=[inp, files, folder, settings_state, agent_states, findings_state],
-                        outputs=[chat, agent_states, findings_state],
-                    )
 
-                    save_btn.click(
-                        fn=lambda a, f: save_last_reply(agent_key, a, f),
-                        inputs=[agent_states, findings_state],
-                        outputs=[findings_state],
-                    )
+                recon_extract_btn.click(
+                    fn=_recon_extract,
+                    inputs=[scope_tb, seeds_tb, recon_files, recon_folder],
+                    outputs=[
+                        recon_scope_view,
+                        recon_intel_summary,
+                        recon_domains,
+                        recon_urls,
+                        recon_params,
+                        recon_ips,
+                        recon_emails,
+                        recon_tech,
+                    ],
+                )
 
-                    return chat
+                def _recon_send(directive, scope_text, seeds_text, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        RECON MODE
 
-            recon_chat = _agent_tab("recon", "Recon Observatory")
-            param_chat = _agent_tab("param", "Param Miner")
-            xss_chat = _agent_tab("xss", "XSS Arsenal")
-            sqli_chat = _agent_tab("sqli_auth", "SQLi / Auth Lab")
-            proto_chat = _agent_tab("proto", "Prototype Pollution Lab")
-            ssrf_chat = _agent_tab("ssrf_rce", "SSRF / RCE Forge")
-            nuclei_chat = _agent_tab("nuclei", "Nuclei Temple")
-            report_chat = _agent_tab("report", "Report Autopilot")
-            payload_chat = _agent_tab("payload", "Payload Kitchen")
+                        Scope (respect strictly):
+                        {scope_text}
+
+                        Seeds:
+                        {seeds_text}
+
+                        Directive:
+                        {directive}
+
+                        Output format:
+                        - 10 next recon actions (ordered)
+                        - Coverage gaps
+                        - Data to request/collect next
+                        """
+                    ).strip()
+                    return agent_send("recon", prompt, up, fol, settings, states, findings)
+
+                recon_send_btn.click(
+                    fn=_recon_send,
+                    inputs=[recon_directive, scope_tb, seeds_tb, recon_files, recon_folder, settings_state, agent_states, findings_state],
+                    outputs=[recon_chat, agent_states, findings_state],
+                )
+                recon_directive.submit(
+                    fn=_recon_send,
+                    inputs=[recon_directive, scope_tb, seeds_tb, recon_files, recon_folder, settings_state, agent_states, findings_state],
+                    outputs=[recon_chat, agent_states, findings_state],
+                )
+                recon_save_btn.click(
+                    fn=lambda a, f: save_last_reply("recon", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
 
             # -----------------
-            # Memory Palace
+            # Param Miner — structured extraction + wordlist staging
             # -----------------
-            with gr.TabItem("Memory Palace (chat history + saved findings)"):
+            with gr.TabItem("Param Miner"):
+                gr.Markdown(
+                    """
+                    ### Param Miner
+                    **Purpose:** turn traces (HAR/URLs/JS) into a prioritized parameter + endpoint candidate set.
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=6):
+                        param_target = gr.Textbox(
+                            label="Target surface (optional)",
+                            placeholder="E.g. https://api.example.com or /graphql or /search",
+                            lines=2,
+                        )
+                        param_notes = gr.Textbox(
+                            label="Notes / constraints",
+                            placeholder="Auth required? Rate limits? Known parameter patterns?",
+                            lines=3,
+                        )
+                        with gr.Row():
+                            param_files = gr.File(label="Artifacts", file_count="multiple")
+                            param_folder = gr.File(label="Folder", file_count="directory")
+
+                        with gr.Row():
+                            param_extract_btn = gr.Button("Extract params (local)")
+                            param_send_btn = gr.Button("Ask Param Miner (Gemini)")
+                            param_save_btn = gr.Button("Save last reply → Findings")
+
+                        param_question = gr.Textbox(
+                            label="Question",
+                            placeholder="What params look vulnerable? Which endpoints deserve fuzzing?",
+                            lines=2,
+                        )
+
+                        param_chat = gr.Chatbot(label="Param Miner reasoning", height=260)
+
+                    with gr.Column(scale=6):
+                        param_summary = gr.Markdown(value="### Extraction\n(press **Extract params**)")
+                        param_candidates = gr.Code(label="Parameter candidates", language="text")
+                        endpoint_candidates = gr.Code(label="Endpoint/URL candidates", language="text")
+                        wordlist_out = gr.Code(label="Wordlist (newline)", language="text")
+
+                def _param_extract(up, fol, target, notes):
+                    paths = _coerce_paths(up) + _coerce_paths(fol)
+                    pack = build_artifact_pack(paths)
+                    intel = pack.get("intel") or {}
+
+                    params = list(intel.get("params") or [])
+                    urls = list(intel.get("urls") or [])
+
+                    summary = ["### Extraction", "", "```", pack.get("summary") or "", "```"]
+                    if target:
+                        summary.append(f"\n**Target surface:** {target}")
+                    if notes:
+                        summary.append(f"\n**Notes:** {notes}")
+
+                    return (
+                        "\n".join(summary),
+                        _list_text(params, 260),
+                        _list_text(urls, 180),
+                        _list_text(params, 800),
+                    )
+
+                param_extract_btn.click(
+                    fn=_param_extract,
+                    inputs=[param_files, param_folder, param_target, param_notes],
+                    outputs=[param_summary, param_candidates, endpoint_candidates, wordlist_out],
+                )
+
+                def _param_send(question, target, notes, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        PARAM MINING MODE
+
+                        Target surface:
+                        {target}
+
+                        Constraints:
+                        {notes}
+
+                        Question:
+                        {question}
+
+                        Output format:
+                        - High-value params (prioritized)
+                        - Suspected sinks (if any)
+                        - Suggested fuzzing strategy
+                        """
+                    ).strip()
+                    return agent_send("param", prompt, up, fol, settings, states, findings)
+
+                param_send_btn.click(
+                    fn=_param_send,
+                    inputs=[param_question, param_target, param_notes, param_files, param_folder, settings_state, agent_states, findings_state],
+                    outputs=[param_chat, agent_states, findings_state],
+                )
+                param_question.submit(
+                    fn=_param_send,
+                    inputs=[param_question, param_target, param_notes, param_files, param_folder, settings_state, agent_states, findings_state],
+                    outputs=[param_chat, agent_states, findings_state],
+                )
+                param_save_btn.click(
+                    fn=lambda a, f: save_last_reply("param", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # XSS Arsenal — configuration-led prompt + snippet staging
+            # -----------------
+            with gr.TabItem("XSS Arsenal"):
+                gr.Markdown(
+                    """
+                    ### XSS Arsenal
+                    **Purpose:** model the injection context and constraints first; then generate a safe, structured test plan.
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=4):
+                        xss_context = gr.Dropdown(
+                            label="Injection context",
+                            choices=[
+                                "HTML body",
+                                "HTML attribute",
+                                "JavaScript string",
+                                "JavaScript template literal",
+                                "URL parameter",
+                                "JSON value",
+                                "SVG context",
+                            ],
+                            value="URL parameter",
+                        )
+                        xss_sink = gr.Dropdown(
+                            label="Suspected sink",
+                            choices=[
+                                "unknown",
+                                "innerHTML",
+                                "outerHTML",
+                                "document.write",
+                                "setAttribute",
+                                "eval / Function",
+                                "location / href",
+                            ],
+                            value="unknown",
+                        )
+                        xss_filters = gr.CheckboxGroup(
+                            label="Constraints / filters",
+                            choices=["WAF present", "CSP present", "Input is URL-encoded", "HTML entity encoding", "JSON escaping"],
+                        )
+                        xss_goal = gr.Textbox(
+                            label="Goal",
+                            placeholder="What do you want to confirm? Reflection? execution? bypass?",
+                            lines=2,
+                        )
+
+                        with gr.Row():
+                            xss_files = gr.File(label="Artifacts", file_count="multiple")
+                            xss_folder = gr.File(label="Folder", file_count="directory")
+
+                        with gr.Row():
+                            xss_send_btn = gr.Button("Build test plan")
+                            xss_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=4):
+                        xss_sample = gr.Code(
+                            label="Request/response snippet (optional)",
+                            language="http",
+                            value="",
+                        )
+                        xss_staged = gr.Code(
+                            label="Staged snippets (from response code fences)",
+                            language="text",
+                            value="",
+                        )
+
+                    with gr.Column(scale=6):
+                        xss_chat = gr.Chatbot(label="XSS reasoning", height=520)
+
+                def _xss_send(goal, ctx, sink, filters, sample, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        XSS MODE
+
+                        Context: {ctx}
+                        Sink: {sink}
+                        Constraints: {', '.join(filters or []) or '(none)'}
+
+                        Goal:
+                        {goal}
+
+                        Evidence snippet:
+                        ```
+                        {sample}
+                        ```
+
+                        Output format:
+                        - Assumptions
+                        - Test plan (steps)
+                        - Payload *patterns* (avoid reckless / out-of-scope)
+                        - Expected signals
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("xss", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+                    staged = extract_code_fences(last)
+                    return chat, staged, states, findings
+
+                xss_send_btn.click(
+                    fn=_xss_send,
+                    inputs=[xss_goal, xss_context, xss_sink, xss_filters, xss_sample, xss_files, xss_folder, settings_state, agent_states, findings_state],
+                    outputs=[xss_chat, xss_staged, agent_states, findings_state],
+                )
+                xss_save_btn.click(
+                    fn=lambda a, f: save_last_reply("xss", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # SQLi / Auth Lab — decision-board + confidence framing
+            # -----------------
+            with gr.TabItem("SQLi / Auth Lab"):
+                gr.Markdown(
+                    """
+                    ### SQLi / Auth Lab
+                    **Purpose:** evaluate exploitability with a checklist mindset (assumptions → tests → confidence).
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        sqli_mode = gr.Radio(label="Focus", choices=["SQLi", "Auth"], value="SQLi")
+                        sqli_db = gr.Dropdown(label="DB hint", choices=["unknown", "mysql", "postgres", "mssql", "sqlite"], value="unknown")
+                        sqli_req = gr.Code(label="Sample request", language="http", value="")
+                        sqli_question = gr.Textbox(label="Question", placeholder="Where should we probe first? What signals matter?", lines=2)
+                        with gr.Row():
+                            sqli_files = gr.File(label="Artifacts", file_count="multiple")
+                            sqli_folder = gr.File(label="Folder", file_count="directory")
+                        with gr.Row():
+                            sqli_send_btn = gr.Button("Evaluate")
+                            sqli_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=7):
+                        sqli_board = gr.Markdown(value="### Decision board\n(press **Evaluate**)\n")
+                        sqli_conf = gr.Label(value="confidence: unknown")
+                        sqli_chat = gr.Chatbot(label="Lab notes", height=360)
+
+                CONF_RE = re.compile(r"confidence\s*[:\-]\s*(\d{1,3})%", re.IGNORECASE)
+
+                def _sqli_send(mode, db, req, question, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        {mode.upper()} LAB MODE
+                        DB hint: {db}
+
+                        Request:
+                        ```http
+                        {req}
+                        ```
+
+                        Question:
+                        {question}
+
+                        Output format:
+                        - Hypothesis
+                        - Test checklist
+                        - Safety constraints
+                        - Confidence: <0-100>%
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("sqli_auth", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+
+                    m = CONF_RE.search(last)
+                    conf = f"confidence: {m.group(1)}%" if m else "confidence: unknown"
+
+                    board = "### Decision board\n\n" + "\n".join((last or "").splitlines()[:26])
+                    return chat, board, conf, states, findings
+
+                sqli_send_btn.click(
+                    fn=_sqli_send,
+                    inputs=[sqli_mode, sqli_db, sqli_req, sqli_question, sqli_files, sqli_folder, settings_state, agent_states, findings_state],
+                    outputs=[sqli_chat, sqli_board, sqli_conf, agent_states, findings_state],
+                )
+                sqli_save_btn.click(
+                    fn=lambda a, f: save_last_reply("sqli_auth", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # Prototype Pollution Lab — vector modelling + PoC snippet staging
+            # -----------------
+            with gr.TabItem("Prototype Pollution Lab"):
+                gr.Markdown(
+                    """
+                    ### Prototype Pollution Lab
+                    **Purpose:** describe the vector (param/path/sink) precisely, then iterate PoCs with evidence.
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        proto_param = gr.Textbox(label="Input vector (parameter/key)", placeholder="E.g. __proto__, constructor, deep[__proto__][x]", lines=2)
+                        proto_path = gr.Textbox(label="Property path to overwrite", placeholder="E.g. toString, isAdmin, auth.role", lines=2)
+                        proto_sink = gr.Dropdown(label="Sink hint", choices=["unknown", "merge/deep-extend", "lodash", "qs", "custom"], value="unknown")
+                        proto_req = gr.Code(label="Sample request", language="http", value="")
+                        with gr.Row():
+                            proto_files = gr.File(label="Artifacts", file_count="multiple")
+                            proto_folder = gr.File(label="Folder", file_count="directory")
+                        with gr.Row():
+                            proto_send_btn = gr.Button("Draft PoCs")
+                            proto_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=7):
+                        proto_staged = gr.Code(label="Staged PoC snippets", language="text", value="")
+                        proto_chat = gr.Chatbot(label="Lab notes", height=420)
+
+                def _proto_send(param, path, sink, req, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        PROTOTYPE POLLUTION MODE
+                        Vector: {param}
+                        Overwrite target: {path}
+                        Sink hint: {sink}
+
+                        Request:
+                        ```http
+                        {req}
+                        ```
+
+                        Output format:
+                        - Preconditions
+                        - 3 PoC variants
+                        - Verification steps
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("proto", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+                    return chat, extract_code_fences(last), states, findings
+
+                proto_send_btn.click(
+                    fn=_proto_send,
+                    inputs=[proto_param, proto_path, proto_sink, proto_req, proto_files, proto_folder, settings_state, agent_states, findings_state],
+                    outputs=[proto_chat, proto_staged, agent_states, findings_state],
+                )
+                proto_save_btn.click(
+                    fn=lambda a, f: save_last_reply("proto", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # SSRF / RCE Forge — chain planning + comparative mitigations
+            # -----------------
+            with gr.TabItem("SSRF / RCE Forge"):
+                gr.Markdown(
+                    """
+                    ### SSRF / RCE Forge
+                    **Purpose:** map reachable internal surfaces and build a controlled chain (what to try vs what to rule out).
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        ssrf_target = gr.Textbox(label="Internal target hypothesis", placeholder="E.g. metadata service, redis, internal admin panel", lines=2)
+                        ssrf_egress = gr.CheckboxGroup(
+                            label="Assumed egress/protocols",
+                            choices=["http", "https", "gopher", "ftp", "file", "dns"],
+                        )
+                        ssrf_req = gr.Code(label="Sample request", language="http", value="")
+                        with gr.Row():
+                            ssrf_files = gr.File(label="Artifacts", file_count="multiple")
+                            ssrf_folder = gr.File(label="Folder", file_count="directory")
+                        with gr.Row():
+                            ssrf_send_btn = gr.Button("Plan chain")
+                            ssrf_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=7):
+                        ssrf_plan = gr.Markdown(value="### Chain plan\n(press **Plan chain**)\n")
+                        ssrf_risk = gr.Label(value="risk: unknown")
+                        ssrf_chat = gr.Chatbot(label="Forge notes", height=360)
+
+                RISK_RE = re.compile(r"risk\s*[:\-]\s*(low|medium|high|critical)", re.IGNORECASE)
+
+                def _ssrf_send(target, egress, req, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        SSRF/RCE MODE
+
+                        Internal target hypothesis:
+                        {target}
+
+                        Assumed allowed protocols:
+                        {', '.join(egress or []) or 'unknown'}
+
+                        Request:
+                        ```http
+                        {req}
+                        ```
+
+                        Output format:
+                        - Reachability assumptions
+                        - Chain steps (try / observe / stop conditions)
+                        - Mitigations comparison table
+                        - Risk: low|medium|high|critical
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("ssrf_rce", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+                    m = RISK_RE.search(last or "")
+                    risk = f"risk: {m.group(1).lower()}" if m else "risk: unknown"
+                    plan = "### Chain plan\n\n" + (last or "")
+                    return chat, plan, risk, states, findings
+
+                ssrf_send_btn.click(
+                    fn=_ssrf_send,
+                    inputs=[ssrf_target, ssrf_egress, ssrf_req, ssrf_files, ssrf_folder, settings_state, agent_states, findings_state],
+                    outputs=[ssrf_chat, ssrf_plan, ssrf_risk, agent_states, findings_state],
+                )
+                ssrf_save_btn.click(
+                    fn=lambda a, f: save_last_reply("ssrf_rce", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # Nuclei Temple — scan plan builder
+            # -----------------
+            with gr.TabItem("Nuclei Temple"):
+                gr.Markdown(
+                    """
+                    ### Nuclei Temple
+                    **Purpose:** turn scope into a controlled scan plan (templates, severity, rate limits, evidence capture).
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        nuclei_scope = gr.Textbox(label="Scope list", placeholder="One domain/URL per line", lines=6)
+                        nuclei_focus = gr.CheckboxGroup(
+                            label="Template focus",
+                            choices=["cves", "misconfiguration", "exposures", "takeovers", "technologies", "fuzzing"],
+                        )
+                        nuclei_constraints = gr.Textbox(label="Constraints", placeholder="Rate limit, auth requirements, exclusions…", lines=2)
+                        with gr.Row():
+                            nuclei_files = gr.File(label="Artifacts", file_count="multiple")
+                            nuclei_folder = gr.File(label="Folder", file_count="directory")
+                        with gr.Row():
+                            nuclei_send_btn = gr.Button("Build scan plan")
+                            nuclei_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=7):
+                        nuclei_cmd = gr.Code(label="Command draft (from code fences)", language="bash", value="")
+                        nuclei_plan = gr.Markdown(value="### Plan\n(press **Build scan plan**)\n")
+                        nuclei_chat = gr.Chatbot(label="Temple notes", height=280)
+
+                def _nuclei_send(scope, focus, constraints, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        NUCLEI MODE
+
+                        Scope:
+                        {scope}
+
+                        Template focus:
+                        {', '.join(focus or []) or 'unspecified'}
+
+                        Constraints:
+                        {constraints}
+
+                        Output format:
+                        - A safe scan plan
+                        - A `nuclei` command in a code block
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("nuclei", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+                    cmd = extract_code_fences(last)
+                    return chat, cmd, "### Plan\n\n" + (last or ""), states, findings
+
+                nuclei_send_btn.click(
+                    fn=_nuclei_send,
+                    inputs=[nuclei_scope, nuclei_focus, nuclei_constraints, nuclei_files, nuclei_folder, settings_state, agent_states, findings_state],
+                    outputs=[nuclei_chat, nuclei_cmd, nuclei_plan, agent_states, findings_state],
+                )
+                nuclei_save_btn.click(
+                    fn=lambda a, f: save_last_reply("nuclei", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # Report Autopilot — form-first structured output + confidence
+            # -----------------
+            with gr.TabItem("Report Autopilot"):
+                gr.Markdown(
+                    """
+                    ### Report Autopilot
+                    **Purpose:** convert evidence into a structured, reviewable report draft (with explicit confidence).
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        rpt_title = gr.Textbox(label="Vulnerability title", placeholder="Short, specific", lines=2)
+                        rpt_asset = gr.Textbox(label="Affected asset / URL", placeholder="https://app.example.com/path", lines=2)
+                        rpt_sev = gr.Dropdown(label="Severity", choices=["info", "low", "medium", "high", "critical"], value="medium")
+                        rpt_impact = gr.Textbox(label="Impact", placeholder="What can an attacker do (within scope)?", lines=3)
+                        rpt_steps = gr.Textbox(label="Steps to reproduce", placeholder="Step-by-step, deterministic", lines=5)
+                        rpt_notes = gr.Textbox(label="Extra notes / constraints", lines=2)
+                        with gr.Row():
+                            rpt_files = gr.File(label="Evidence files", file_count="multiple")
+                            rpt_folder = gr.File(label="Evidence folder", file_count="directory")
+
+                        with gr.Row():
+                            rpt_send_btn = gr.Button("Draft report")
+                            rpt_save_btn = gr.Button("Save last reply → Findings")
+
+                        report_chat = gr.Chatbot(label="Report conversation", height=260)
+
+                    with gr.Column(scale=7):
+                        rpt_conf = gr.Label(value="confidence: unknown")
+                        rpt_json = gr.JSON(label="Structured fields", value={})
+                        rpt_md = gr.Markdown(value="### Draft\n(press **Draft report**)\n")
+
+                def _report_send(title, asset, sev, impact, steps, notes, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        REPORT MODE
+
+                        Title: {title}
+                        Asset: {asset}
+                        Severity: {sev}
+                        Impact: {impact}
+
+                        Steps to reproduce:
+                        {steps}
+
+                        Notes:
+                        {notes}
+
+                        Return:
+                        1) A JSON object in a fenced ```json block with keys:
+                           title, asset, severity, summary, impact, steps_to_reproduce, remediation, references, confidence
+                        2) Then a clean Markdown report body.
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("report", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+                    obj = extract_first_json(last) or {}
+                    conf = obj.get("confidence")
+                    conf_label = f"confidence: {conf}" if conf is not None else "confidence: unknown"
+                    return chat, conf_label, obj, "### Draft\n\n" + (last or ""), states, findings
+
+                rpt_send_btn.click(
+                    fn=_report_send,
+                    inputs=[rpt_title, rpt_asset, rpt_sev, rpt_impact, rpt_steps, rpt_notes, rpt_files, rpt_folder, settings_state, agent_states, findings_state],
+                    outputs=[report_chat, rpt_conf, rpt_json, rpt_md, agent_states, findings_state],
+                )
+                rpt_save_btn.click(
+                    fn=lambda a, f: save_last_reply("report", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # Payload Kitchen — intent + constraints → staged snippets
+            # -----------------
+            with gr.TabItem("Payload Kitchen"):
+                gr.Markdown(
+                    """
+                    ### Payload Kitchen
+                    **Purpose:** produce payload *families* for a goal, with constraints and verification signals.
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        p_goal = gr.Dropdown(
+                            label="Goal",
+                            choices=["xss", "sqli", "ssrf", "proto", "auth", "open redirect", "misc"],
+                            value="xss",
+                        )
+                        p_constraints = gr.Textbox(label="Constraints", placeholder="Encoding/WAF/CSP/length limits/scope rules…", lines=3)
+                        p_context = gr.Code(label="Context snippet", language="text", value="")
+                        with gr.Row():
+                            p_files = gr.File(label="Artifacts", file_count="multiple")
+                            p_folder = gr.File(label="Folder", file_count="directory")
+                        with gr.Row():
+                            p_send_btn = gr.Button("Generate")
+                            p_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=7):
+                        payload_staged = gr.Code(label="Staged snippets", language="text", value="")
+                        payload_chat = gr.Chatbot(label="Kitchen notes", height=420)
+
+                def _payload_send(goal, constraints, ctx, up, fol, settings, states, findings):
+                    prompt = textwrap.dedent(
+                        f"""
+                        PAYLOAD MODE
+
+                        Goal: {goal}
+                        Constraints: {constraints}
+
+                        Context:
+                        ```
+                        {ctx}
+                        ```
+
+                        Output format:
+                        - Payload patterns in code blocks
+                        - Verification signals
+                        - Stop conditions / scope reminders
+                        """
+                    ).strip()
+
+                    chat, states, findings = agent_send("payload", prompt, up, fol, settings, states, findings)
+                    last = chat[-1][1] if chat else ""
+                    return chat, extract_code_fences(last), states, findings
+
+                p_send_btn.click(
+                    fn=_payload_send,
+                    inputs=[p_goal, p_constraints, p_context, p_files, p_folder, settings_state, agent_states, findings_state],
+                    outputs=[payload_chat, payload_staged, agent_states, findings_state],
+                )
+                p_save_btn.click(
+                    fn=lambda a, f: save_last_reply("payload", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
+
+            # -----------------
+            # Memory Palace — system-wide recall + saved findings
+            # -----------------
+            with gr.TabItem("Memory Palace"):
                 mem_chat = gr.Chatbot(label=None, height=360)
                 mem_view = gr.Markdown(value=memory_palace_view(_init_states(specs), []))
 
@@ -1472,34 +2486,105 @@ def build_ui() -> gr.Blocks:
                 )
 
             # -----------------
-            # Ops Console (extra)
+            # Ops Console — raw / ad-hoc with minimal ceremony
             # -----------------
-            _agent_tab("kitchen_sink", "Ops Console")
+            with gr.TabItem("Ops Console"):
+                gr.Markdown(
+                    """
+                    ### Ops Console
+                    **Purpose:** high-density, ad-hoc tasks. Bring your own structure.
+                    """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        ops_prompt = gr.Textbox(label="Instruction", placeholder="Give a precise task; include desired output format.", lines=6)
+                        with gr.Row():
+                            ops_files = gr.File(label="Artifacts", file_count="multiple")
+                            ops_folder = gr.File(label="Folder", file_count="directory")
+                        with gr.Row():
+                            ops_send_btn = gr.Button("Run")
+                            ops_save_btn = gr.Button("Save last reply → Findings")
+
+                    with gr.Column(scale=7):
+                        ops_chat = gr.Chatbot(label="Ops output", height=520)
+
+                ops_send_btn.click(
+                    fn=lambda t, up, fol, s, st, f: agent_send("kitchen_sink", t, up, fol, s, st, f),
+                    inputs=[ops_prompt, ops_files, ops_folder, settings_state, agent_states, findings_state],
+                    outputs=[ops_chat, agent_states, findings_state],
+                )
+                ops_prompt.submit(
+                    fn=lambda t, up, fol, s, st, f: agent_send("kitchen_sink", t, up, fol, s, st, f),
+                    inputs=[ops_prompt, ops_files, ops_folder, settings_state, agent_states, findings_state],
+                    outputs=[ops_chat, agent_states, findings_state],
+                )
+                ops_save_btn.click(
+                    fn=lambda a, f: save_last_reply("kitchen_sink", a, f),
+                    inputs=[agent_states, findings_state],
+                    outputs=[findings_state],
+                )
 
             # -----------------
-            # Settings
+            # Settings — API key vault (save/update/validate/persist)
             # -----------------
             with gr.TabItem("Settings"):
-                gr.Markdown("### Gemini Settings")
-                api_key = gr.Textbox(
-                    label="Gemini API key",
-                    placeholder="AIza...",
+                gr.Markdown(
+                    """
+                    ### Settings: Gemini 2.5 Flash API Key
+
+                    This app runs on a server. If you choose **Persist to disk**, the key is stored on the **server's filesystem**
+                    (mode `0600`) and reused across sessions.
+                    """
+                )
+
+                settings_status_md = gr.Markdown(value=settings_status(initial_settings))
+
+                api_key_in = gr.Textbox(
+                    label="Gemini API key (masked)",
+                    placeholder="Paste key here (will be cleared after save)",
                     type="password",
                 )
-                apply_btn = gr.Button("Apply")
-                status = gr.Markdown(value="[!] API key not set.")
+                persist_ck = gr.Checkbox(label="Persist on server (recommended)", value=True)
 
-                apply_btn.click(
-                    fn=settings_apply_and_status,
-                    inputs=[api_key, settings_state],
-                    outputs=[settings_state, status],
+                with gr.Row():
+                    save_validate_btn = gr.Button("Save & Validate")
+                    validate_btn = gr.Button("Validate current")
+                    clear_btn = gr.Button("Clear stored key")
+
+                def _save_validate_ui(key, persist, st):
+                    new_st, status = settings_save_and_validate(key, persist, st)
+                    return new_st, status, ""
+
+                def _validate_ui(st):
+                    new_st, status = settings_validate_current(st)
+                    return new_st, status
+
+                def _clear_ui(st):
+                    new_st, status = settings_clear_key(st)
+                    return new_st, status, ""
+
+                save_validate_btn.click(
+                    fn=_save_validate_ui,
+                    inputs=[api_key_in, persist_ck, settings_state],
+                    outputs=[settings_state, settings_status_md, api_key_in],
+                )
+                validate_btn.click(
+                    fn=_validate_ui,
+                    inputs=[settings_state],
+                    outputs=[settings_state, settings_status_md],
+                )
+                clear_btn.click(
+                    fn=_clear_ui,
+                    inputs=[settings_state],
+                    outputs=[settings_state, settings_status_md, api_key_in],
                 )
 
                 gr.Markdown(
                     """
                     **Notes**
-                    - Model defaults to `gemini-1.5-flash` and auto-upgrades to the best available Flash preview when possible.
-                    - Safety override: Dangerous content is set to BLOCK_NONE at the API layer (authorized use assumed).
+                    - Key validation uses `list_models()` to confirm the key works and to detect the best available **Flash** model.
+                    - If `GEMINI_API_KEY` / `GOOGLE_API_KEY` is set in the environment, it is used by default (no disk writes).
                     """
                 )
 
@@ -1570,6 +2655,8 @@ def build_ui() -> gr.Blocks:
                 findings_state,
             ],
         )
+
+        demo.load(fn=settings_status, inputs=[settings_state], outputs=[settings_status_md])
 
     return demo
 
