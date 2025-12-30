@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pdb
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# Gradio / local artifacts
+*.log
+*.sqlite3
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
